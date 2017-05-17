@@ -19,8 +19,6 @@ namespace rbegin_rend
     {
         std::vector<int> myvector(5); // 5 default-constructed ints;
 
-        int i = 0;
-
         for(std::vector<int>::reverse_iterator iter = myvector.rbegin(); iter != myvector.rend(); ++iter)
             std::cout << ' '<< *iter ;
         std::cout << '\n';

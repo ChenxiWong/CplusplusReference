@@ -7,14 +7,27 @@
 # brief:
 #########################################################################
 CC:=g++
-test: test_vector.o test_vector.h test_vector.d
-	$(CC) $^ -o $@
-%.d:%.c
-	$(CC) -MM $< >$@.$$$$; \
-	sed 's,\($*\).o[:]*,\1.o $@:,g' < $@.$$$$ >$@; \
+CFLAGS:= -Wall -O
+INCLUDEFLAGS:=
+BIN:=test
+LDFLAGS:=
+OBJ:=test_vector.o
+
+-include $(OBJ:.o=.d)
+
+.PHONY:all
+all:$(BIN)
+
+$(BIN):$(OBJ)
+	$(CC) $^ -o $@ $(CFLAGS)
+%.o:%.cpp
+	$(CC) -o $@ -c $< $(CFLAGS) $(INCLUDEFLAGS)
+%.d:%.cpp
+	@set -e; $(CC) -MM $< $(INCLUDEFLAGS) > $@.$$$$; \
+	sed 's,\($*\).o[:],\1.o $@:,g' < $@.$$$$ >$@; \
 	rm -f $@.$$$$
 .PHONY: clean
 
 clean:
-	rm -rf *.o
+	rm -rf *.o $(BIN) *.d *.d.*
 

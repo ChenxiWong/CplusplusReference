@@ -19,6 +19,10 @@ int main(int argc, char* argv[])
     std::string str("");
 
     std::cout<<"test rbegin_rend , input: reverse"<<std::endl;
+
+
+
+
     std::cin>>str;
     if(str == "reverse")
     {
