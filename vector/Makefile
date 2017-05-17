@@ -7,23 +7,23 @@
 # brief:
 #########################################################################
 CC:=g++
-CFLAGS:= -Wall -O
+CFLAGS:= -Wall -O2 -std=c++11
 INCLUDEFLAGS:=
 BIN:=test
 LDFLAGS:=
 OBJ:=test_vector.o
 
--include $(OBJ:.o=.d)
-
 .PHONY:all
 all:$(BIN)
-
 $(BIN):$(OBJ)
 	$(CC) $^ -o $@ $(CFLAGS)
+
+-include $(OBJ:.o=.d)
+
 %.o:%.cpp
 	$(CC) -o $@ -c $< $(CFLAGS) $(INCLUDEFLAGS)
 %.d:%.cpp
-	@set -e; $(CC) -MM $< $(INCLUDEFLAGS) > $@.$$$$; \
+	@set -e;$(CC) -MM $< $(INCLUDEFLAGS) > $@.$$$$; \
 	sed 's,\($*\).o[:],\1.o $@:,g' < $@.$$$$ >$@; \
 	rm -f $@.$$$$
 .PHONY: clean
