@@ -18,7 +18,7 @@ all:$(BIN)
 $(BIN):$(OBJ)
 	$(CC) $^ -o $@ $(CFLAGS)
 
--include $(OBJ:.o=.d)
+sinclude $(OBJ:.o=.d)
 
 %.o:%.cpp
 	$(CC) -o $@ -c $< $(CFLAGS) $(INCLUDEFLAGS)
