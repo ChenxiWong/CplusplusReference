@@ -26,7 +26,27 @@ namespace rbegin_rend
         return 0;
     }
 }
-
+namespace common_use
+{
+    int test_main(int argc, char* argv[])
+    {
+        std::vector<int> client(16);
+        std::cout<<"client size is "<<client.size()<<std::endl;
+        int* p = &(*(client.begin()));
+        int* q = p + 16;
+        for(;p != q; ++p)
+        {
+            *p = 100;
+            std::cout<< int(q-p) <<std::endl;
+        }
+        std::vector<int>::reverse_iterator iter = client.rbegin();
+        for(; iter != client.rend(); ++iter)
+        {
+            std::cout<< *iter <<std::endl;
+        }
+    return 0;
+    }
+}
 
 
 #endif  /*TEST_VECTOR_H*/

@@ -7,7 +7,7 @@
 # brief:
 #########################################################################
 CC:=g++
-CFLAGS:= -Wall -O2 -std=c++11
+CFLAGS:= -Wall -g -std=c++11
 INCLUDEFLAGS:=
 BIN:=test
 LDFLAGS:=

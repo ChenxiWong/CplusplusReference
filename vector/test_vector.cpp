@@ -16,6 +16,7 @@
 
 int main(int argc, char* argv[])
 {
+    test_work(common_use);
     std::string str("");
     std::cout<<"test rbegin_rend , input: reverse"<<std::endl;
     std::cin>>str;
