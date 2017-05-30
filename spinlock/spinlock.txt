@@ -662,7 +662,7 @@ static int slock_trylock(slock *s)
 }
 
 
-下面是另外一种实现方式，称为stack-lock算法，
+/* 下面是另外一种实现方式，称为stack-lock算法，*/
 
 typedef struct stlock_t stlock_t;
 struct stlock_t

@@ -242,6 +242,665 @@ static int k42_trylock(k42lock *l)
     return EBUSY;
 }
 
+/* 改进mcs、k42算法  */
+typedef struct listlock_t listlock_t;
+struct listlock_t
+{
+    listlock_t *next;
+    int spin;
+};
+typedef struct listlock_t *listlock;
+
+#define LLOCK_FLAG (void *)1
+
+void listlock_lock(listlock *l)
+{
+    listlock_t me;
+    listlock_t *tail;
+
+    /* Fast path - no users */
+    if (!cmpxchg(l, NULL, LLOCK_FLAG)) return;
+
+    me.next = LLOCK_FLAG;
+    me.spin = 0;
+
+    /* Convert into a wait list */
+    tail = xchg_64(l, &me);
+
+    if (tail)
+    {
+        /* Add myself to the list of waiters */
+        if (tail == LLOCK_FLAG) tail = NULL;
+        me.next = tail;
+
+        /* Wait for being able to go */
+        while (!me.spin) cpu_relax();
+
+        return;
+    }
+
+    /* Try to convert to an exclusive lock */
+    if (cmpxchg(l, &me, LLOCK_FLAG) == &me) return;
+
+    /* Failed - there is now a wait list */
+    tail = *l;
+
+    /* Scan to find who is after me */
+    while (1)
+    {
+        /* Wait for them to enter their next link */
+        while (tail->next == LLOCK_FLAG) cpu_relax();
+
+        if (tail->next == &me)
+        {
+            /* Fix their next pointer */
+            tail->next = NULL;
+
+            return;
+        }
+
+        tail = tail->next;
+    }
+}
+
+void listlock_unlock(listlock *l)
+{
+    listlock_t *tail;
+    listlock_t *tp;
+
+    while (1)
+    {
+        tail = *l;
+
+        barrier();
+
+        /* Fast path */
+        if (tail == LLOCK_FLAG)
+        {
+            if (cmpxchg(l, LLOCK_FLAG, NULL) == LLOCK_FLAG) return;
+
+            continue;
+        }
+
+        tp = NULL;
+
+        /* Wait for partially added waiter */
+        while (tail->next == LLOCK_FLAG) cpu_relax();
+
+        /* There is a wait list */
+        if (tail->next) break;
+
+        /* Try to convert to a single-waiter lock */
+        if (cmpxchg(l, tail, LLOCK_FLAG) == tail)
+        {
+            /* Unlock */
+            tail->spin = 1;
+
+            return;
+        }
+
+        cpu_relax();
+    }
+
+    /* A long list */
+    tp = tail;
+    tail = tail->next;
+
+    /* Scan wait list */
+    while (1)
+    {
+        /* Wait for partially added waiter */
+        while (tail->next == LLOCK_FLAG) cpu_relax();
+
+        if (!tail->next) break;
+
+        tp = tail;
+        tail = tail->next;
+    }
+
+    tp->next = NULL;
+
+    barrier();
+
+    /* Unlock */
+    tail->spin = 1;
+}
+
+int listlock_trylock(listlock *l)
+{
+    /* Simple part of a spin-lock */
+    if (!cmpxchg(l, NULL, LLOCK_FLAG)) return 0;
+
+    /* Failure! */
+    return EBUSY;
+}
+
+/* 进一步改进后的自旋锁  */
+typedef struct bitlistlock_t bitlistlock_t;
+struct bitlistlock_t
+{
+    bitlistlock_t *next;
+    int spin;
+};
+
+typedef bitlistlock_t *bitlistlock;
+
+#define BLL_USED ((bitlistlock_t *) -2LL)
+#include <stdint.h>
+static void bitlistlock_lock(bitlistlock *l)
+{
+    bitlistlock_t me;
+    bitlistlock_t *tail;
+
+    /* Grab control of list */
+    while (atomic_bitsetandtest(l, 0)) cpu_relax();
+
+    /* Remove locked bit */
+    tail = (bitlistlock_t *) ((uintptr_t) *l & ~1LL);
+
+    /* Fast path, no waiters */
+    if (!tail)
+    {
+        /* Set to be a flag value */
+        *l = BLL_USED;
+        return;
+    }
+
+    if (tail == BLL_USED) tail = NULL;
+    me.next = tail;
+    me.spin = 0;
+
+    barrier();
+
+    /* Unlock, and add myself to the wait list */
+    *l = &me;
+
+    /* Wait for the go-ahead */
+    while (!me.spin) cpu_relax();
+}
+
+static void bitlistlock_unlock(bitlistlock *l)
+{
+    bitlistlock_t *tail;
+    bitlistlock_t *tp;
+
+    /* Fast path - no wait list */
+    if (cmpxchg(l, BLL_USED, NULL) == BLL_USED) return;
+
+    /* Grab control of list */
+    while (atomic_bitsetandtest(l, 0)) cpu_relax();
+
+    tp = *l;
+
+    barrier();
+
+    /* Get end of list */
+    tail = (bitlistlock_t *) ((uintptr_t) tp & ~1LL);
+
+    /* Actually no users? */
+    if (tail == BLL_USED)
+    {
+        barrier();
+        *l = NULL;
+        return;
+    }
+
+    /* Only one entry on wait list? */
+    if (!tail->next)
+    {
+        barrier();
+
+        /* Unlock bitlock */
+        *l = BLL_USED;
+
+        barrier();
+
+        /* Unlock lock */
+        tail->spin = 1;
+
+        return;
+    }
+
+    barrier();
+
+    /* Unlock bitlock */
+    *l = tail;
+
+    barrier();
+
+    /* Scan wait list for start */
+    do
+    {
+        tp = tail;
+        tail = tail->next;
+    }
+    while (tail->next);
+
+    tp->next = NULL;
+
+    barrier();
+
+    /* Unlock */
+    tail->spin = 1;
+}
+
+static int bitlistlock_trylock(bitlistlock *l)
+{
+    if (!*l && (cmpxchg(l, NULL, BLL_USED) == NULL)) return 0;
+
+    return EBUSY;
+}
+
+/*  进一步改进自旋锁  */
+
+
+/* Bit-lock for editing the wait block */
+#define SLOCK_LOCK 1
+#define SLOCK_LOCK_BIT 0
+
+/* Has an active user */
+#define SLOCK_USED 2
+
+#define SLOCK_BITS 3
+
+typedef struct slock slock;
+struct slock
+{
+    uintptr_t p;
+};
+
+typedef struct slock_wb slock_wb;
+struct slock_wb
+{
+    /*
+     * last points to the last wait block in the chain.
+     * The value is only valid when read from the first wait block.
+     */
+    slock_wb *last;
+
+    /* next points to the next wait block in the chain. */
+    slock_wb *next;
+
+    /* Wake up? */
+    int wake;
+};
+
+/* Wait for control of wait block */
+static slock_wb *slockwb(slock *s)
+{
+    uintptr_t p;
+
+    /* Spin on the wait block bit lock */
+    while (atomic_bitsetandtest(&s->p, SLOCK_LOCK_BIT))
+    {
+        cpu_relax();
+    }
+
+    p = s->p;
+
+    if (p <= SLOCK_BITS)
+    {
+        /* Oops, looks like the wait block was removed. */
+        atomic_dec(&s->p);
+        return NULL;
+    }
+
+    return (slock_wb *)(p - SLOCK_LOCK);
+}
+
+static void slock_lock(slock *s)
+{
+    slock_wb swblock;
+
+    /* Fastpath - no other readers or writers */
+    if (!s->p && (cmpxchg(&s->p, 0, SLOCK_USED) == 0)) return;
+
+    /* Initialize wait block */
+    swblock.next = NULL;
+    swblock.last = &swblock;
+    swblock.wake = 0;
+
+    while (1)
+    {
+        uintptr_t p = s->p;
+
+        cpu_relax();
+
+        /* Fastpath - no other readers or writers */
+        if (!p)
+        {
+            if (cmpxchg(&s->p, 0, SLOCK_USED) == 0) return;
+            continue;
+        }
+
+        if (p > SLOCK_BITS)
+        {
+            slock_wb *first_wb, *last;
+
+            first_wb = slockwb(s);
+            if (!first_wb) continue;
+
+            last = first_wb->last;
+            last->next = &swblock;
+            first_wb->last = &swblock;
+
+            /* Unlock */
+            barrier();
+            s->p &= ~SLOCK_LOCK;
+
+            break;
+        }
+
+        /* Try to add the first wait block */
+        if (cmpxchg(&s->p, p, (uintptr_t)&swblock) == p) break;
+    }
+
+    /* Wait to acquire exclusive lock */
+    while (!swblock.wake) cpu_relax();
+}
+
+static void slock_unlock(slock *s)
+{
+    slock_wb *next;
+    slock_wb *wb;
+    uintptr_t np;
+
+    while (1)
+    {
+        uintptr_t p = s->p;
+
+        /* This is the fast path, we can simply clear the SRWLOCK_USED bit. */
+        if (p == SLOCK_USED)
+        {
+            if (cmpxchg(&s->p, SLOCK_USED, 0) == SLOCK_USED) return;
+            continue;
+        }
+
+        /* There's a wait block, we need to wake the next pending user */
+        wb = slockwb(s);
+        if (wb) break;
+
+        cpu_relax();
+    }
+
+    next = wb->next;
+    if (next)
+    {
+        /*
+         * There's more blocks chained, we need to update the pointers
+         * in the next wait block and update the wait block pointer.
+         */
+        np = (uintptr_t) next;
+
+        next->last = wb->last;
+    }
+    else
+    {
+        /* Convert the lock to a simple lock. */
+        np = SLOCK_USED;
+    }
+
+    barrier();
+    /* Also unlocks lock bit */
+    s->p = np;
+    barrier();
+
+    /* Notify the next waiter */
+    wb->wake = 1;
+
+    /* We released the lock */
+}
+
+static int slock_trylock(slock *s)
+{
+    /* No other readers or writers? */
+    if (!s->p && (cmpxchg(&s->p, 0, SLOCK_USED) == 0)) return 0;
+
+    return EBUSY;
+}
+
+/* 下面是另外一种实现方式，称为stack-lock算法，*/
+
+typedef struct stlock_t stlock_t;
+struct stlock_t
+{
+    stlock_t *next;
+};
+
+typedef struct stlock_t *stlock;
+
+ __attribute__((noinline)) void stlock_lock(stlock *l)
+{
+    stlock_t *me = NULL;
+
+    barrier();
+    me = xchg_64(l, &me);
+
+    /* Wait until we get the lock */
+    while (me) cpu_relax();
+}
+
+#define MAX_STACK_SIZE (1<<12)
+
+ __attribute__((noinline)) int on_stack(void *p)
+{
+    int x;
+
+    uintptr_t u = (uintptr_t) &x;
+
+    return ((u - (uintptr_t)p + MAX_STACK_SIZE) < MAX_STACK_SIZE * 2);
+}
+
+ __attribute__((noinline)) void stlock_unlock(stlock *l)
+{
+    stlock_t *tail = *l;
+    barrier();
+
+    /* Fast case */
+    if (on_stack(tail))
+    {
+        /* Try to remove the wait list */
+        if (cmpxchg(l, tail, NULL) == tail) return;
+
+        tail = *l;
+    }
+
+    /* Scan wait list */
+    while (1)
+    {
+        /* Wait for partially added waiter */
+        while (!tail->next) cpu_relax();
+
+        if (on_stack(tail->next)) break;
+
+        tail = tail->next;
+    }
+
+    barrier();
+
+    /* Unlock */
+    tail->next = NULL;
+}
+
+ int stlock_trylock(stlock *l)
+{
+    stlock_t me;
+
+    if (!cmpxchg(l, NULL, &me)) return 0;
+
+    return EBUSY;
+}
+
+
+/*  进一步改进后的自旋锁  */
+typedef struct plock_t plock_t;
+struct plock_t
+{
+    plock_t *next;
+};
+
+typedef struct plock plock;
+struct plock
+{
+    plock_t *next;
+    plock_t *prev;
+    plock_t *last;
+};
+
+void plock_lock(plock *l)
+{
+    plock_t *me = NULL;
+    plock_t *prev;
+
+    barrier();
+    me = xchg_64(l, &me);
+
+    prev = NULL;
+
+    /* Wait until we get the lock */
+    while (me)
+    {
+        /* Scan wait list for my previous */
+        if (l->next != (plock_t *) &me)
+        {
+            plock_t *t = l->next;
+
+            while (me)
+            {
+                if (t->next == (plock_t *) &me)
+                {
+                    prev = t;
+
+                    while (me) cpu_relax();
+
+                    goto done;
+                }
+
+                if (t->next) t = t->next;
+                cpu_relax();
+            }
+        }
+        cpu_relax();
+    }
+
+done:
+    l->prev = prev;
+    l->last = (plock_t *) &me;
+}
+
+void plock_unlock(plock *l)
+{
+    plock_t *tail;
+
+    /* Do I know my previous? */
+    if (l->prev)
+    {
+        /* Unlock */
+        l->prev->next = NULL;
+        return;
+    }
+
+    tail = l->next;
+    barrier();
+
+    /* Fast case */
+    if (tail == l->last)
+    {
+        /* Try to remove the wait list */
+        if (cmpxchg(&l->next, tail, NULL) == tail) return;
+
+        tail = l->next;
+    }
+
+    /* Scan wait list */
+    while (1)
+    {
+        /* Wait for partially added waiter */
+        while (!tail->next) cpu_relax();
+
+        if (tail->next == l->last) break;
+
+        tail = tail->next;
+    }
+
+    barrier();
+
+    /* Unlock */
+    tail->next = NULL;
+}
+
+int plock_trylock(plock *l)
+{
+    plock_t me;
+
+    if (!cmpxchg(&l->next, NULL, &me))
+    {
+        l->last = &me;
+        return 0;
+    }
+
+    return EBUSY;
+}
+
+
+/* 下面介绍另外一种算法，ticket lock算法，实际上，Linux内核正是采用了该算法，不过考虑到执行效率，人家是以汇编形式写的， */
+
+typedef union ticketlock ticketlock;
+
+union ticketlock
+{
+    unsigned u;
+    struct
+    {
+        unsigned short ticket;
+        unsigned short users;
+    } s;
+};
+
+void ticket_lock(ticketlock *t)
+{
+    unsigned short me = atomic_xadd(&t->s.users, 1);
+
+    while (t->s.ticket != me) cpu_relax();
+}
+
+void ticket_unlock(ticketlock *t)
+{
+    barrier();
+    t->s.ticket++;
+}
+
+int ticket_trylock(ticketlock *t)
+{
+    unsigned short me = t->s.users;
+    unsigned short menew = me + 1;
+    unsigned cmp = ((unsigned) me << 16) + me;
+    unsigned cmpnew = ((unsigned) menew << 16) + me;
+
+    if (cmpxchg(&t->u, cmp, cmpnew) == cmp) return 0;
+
+    return EBUSY;
+}
+
+int ticket_lockable(ticketlock *t)
+{
+    ticketlock u = *t;
+    barrier();
+    return (u.s.ticket == u.s.users);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
